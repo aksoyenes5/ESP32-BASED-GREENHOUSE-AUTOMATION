@@ -1,0 +1,558 @@
+
+#include <DHT.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <BluetoothSerial.h>
+
+
+// DHT22 Ayarları
+#define DHTPIN 14
+#define DHTTYPE DHT22
+
+// Analog Giriş Pinleri
+#define SOIL_MOISTURE_PIN 34
+#define LDR_PIN 35
+#define MQ135_PIN 32
+#define WATER_SENSOR_PIN 33
+
+// Röle Pinleri
+#define VALVE_RELAY_PIN 26
+#define FAN_RELAY_PIN 13
+#define HEATER_RELAY_PIN 25
+
+// Buzzer
+#define BUZZER_PIN 27
+
+// Buton Pinleri
+#define BTN_FESLEGEN 21
+#define BTN_BIBER 22
+#define BTN_LAVANTA 23
+
+// RGB LED Pinleri
+#define RED_PIN 18
+#define GREEN_PIN 19
+#define BLUE_PIN 12
+
+// PWM Kanalları
+#define RED_CHANNEL 0
+#define GREEN_CHANNEL 1
+#define BLUE_CHANNEL 2
+
+// Modlar
+enum Mode { MODE_IDLE,
+            MODE_LAVANTA,
+            MODE_FESLEGEN,
+            MODE_BIBER };
+Mode currentMode = MODE_IDLE;
+Mode previousMode = MODE_IDLE;
+
+enum ControlMode {
+  MODE_AUTO,
+  MODE_MANUAL
+};
+
+ControlMode control_mode = MODE_AUTO;
+
+// Veri yapısı
+typedef struct {
+  float temperature;
+  float humidity;
+  uint16_t soil_moisture;
+  uint16_t light_level;
+  uint16_t air_quality;
+  uint16_t water_level;
+} sensor_data_t;
+sensor_data_t sensor_data;
+
+typedef struct {
+  uint16_t moisture_threshold;
+  float temp_min;
+  float temp_max;
+  uint16_t water_low_threshold;
+} thresholds_t;
+thresholds_t thresholds;
+
+uint8_t baseRed = 0;
+uint8_t baseGreen = 0;
+uint8_t baseBlue = 0;
+
+bool valve_flag = false;
+bool fan_flag = false;
+bool heater_flag = false;
+bool buzzer_flag = false;
+bool main_page_active = true;
+
+unsigned long previous_millis = 0;
+const unsigned long interval = 1000;
+
+unsigned long last_button_press_time = 0;
+const unsigned long debounce_delay = 1000;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+TFT_eSPI tft = TFT_eSPI();
+
+BluetoothSerial SerialBT;
+
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("Akıllı Sera Otomasyonu");
+  dht.begin();
+
+  pinMode(VALVE_RELAY_PIN, OUTPUT);
+  pinMode(FAN_RELAY_PIN, OUTPUT);
+  pinMode(HEATER_RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(VALVE_RELAY_PIN, LOW);
+  digitalWrite(FAN_RELAY_PIN, HIGH);
+  digitalWrite(HEATER_RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(BTN_FESLEGEN, INPUT_PULLUP);
+  pinMode(BTN_BIBER, INPUT_PULLUP);
+  pinMode(BTN_LAVANTA, INPUT_PULLUP);
+
+  tft.init();
+  pinMode(17, OUTPUT);
+  digitalWrite(17, LOW);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(true);
+  digitalWrite(17, HIGH);
+
+  rgb_setup();
+
+  main_page();
+
+  handle_mode();
+}
+
+void loop() {
+  handle_mode();
+  bluetooth_receive();
+
+  unsigned long current_millis = millis();
+  if (current_millis - previous_millis >= interval) {
+    previous_millis = current_millis;
+    read_sensors();
+    print_sensor_data();
+    if (main_page_active == false) {
+      sensor_page(currentMode);
+      //adjust_brightness();
+    }
+    valve_control();
+    temperature_control();
+    buzzer_control();
+    bluetooth_send();
+  }
+}
+
+void handle_mode() {
+  unsigned long current_time_button = millis();
+
+  if (current_time_button - last_button_press_time < debounce_delay) {
+    return;
+  }
+
+  if (digitalRead(BTN_FESLEGEN) == LOW && digitalRead(BTN_BIBER) == LOW && digitalRead(BTN_LAVANTA) == LOW && main_page_active == false) {
+    currentMode = MODE_IDLE;
+    last_button_press_time = current_time_button;
+  }
+  if (digitalRead(BTN_FESLEGEN) == LOW && main_page_active == true) {
+    currentMode = MODE_FESLEGEN;
+    last_button_press_time = current_time_button;
+  }
+  if (digitalRead(BTN_BIBER) == LOW && main_page_active == true) {
+    currentMode = MODE_BIBER;
+    last_button_press_time = current_time_button;
+  }
+  if (digitalRead(BTN_LAVANTA) == LOW && main_page_active == true) {
+    currentMode = MODE_LAVANTA;
+    last_button_press_time = current_time_button;
+  }
+
+  if (currentMode != previousMode) {
+    switch (currentMode) {
+      case MODE_FESLEGEN:
+        thresholds = { 2600, 24.0, 28.0, 2000 };  //treshold struck ında sırayla 1. toprak nem eşiği 2ve3 sıcaklık 4. su deposu seviyesi.
+        main_page_active = false;
+        Serial.println(" FESLEGEN modu seçildi.");
+        sensor_page(currentMode);
+        break;
+      case MODE_BIBER:
+        thresholds = { 2700, 26, 32, 2000 };  //26-32 olcak
+        main_page_active = false;
+        Serial.println(" BIBER modu seçildi.");
+        sensor_page(currentMode);
+        break;
+      case MODE_LAVANTA:
+        thresholds = { 2800, 22, 26, 2000 };  //22-26
+        main_page_active = false;
+        Serial.println(" LAVANTA modu seçildi.");
+        sensor_page(currentMode);
+        break;
+      case MODE_IDLE:
+        main_page_active = true;
+        Serial.println("MODE IDLE");
+        relay_close();
+        main_page();
+        break;
+    }
+    set_rgb_color(currentMode);
+    previousMode = currentMode;
+    delay(50);
+  }
+}
+
+void read_sensors() {
+  Serial.println(" Sensör verileri okunuyor...");
+  sensor_data.temperature = dht.readTemperature();
+  sensor_data.humidity = dht.readHumidity();
+  sensor_data.soil_moisture = analogRead(SOIL_MOISTURE_PIN);
+  sensor_data.light_level = analogRead(LDR_PIN);
+  sensor_data.air_quality = analogRead(MQ135_PIN);
+  sensor_data.water_level = analogRead(WATER_SENSOR_PIN);
+}
+
+void print_sensor_data() {
+  if (isnan(sensor_data.temperature) || isnan(sensor_data.humidity)) {
+    Serial.println(" DHT22 verisi okunamadı!");
+  } else {
+    Serial.print(" Sıcaklık: ");
+    Serial.print(sensor_data.temperature);
+    Serial.print(" °C\t Nem: ");
+    Serial.print(sensor_data.humidity);
+    Serial.println(" %");
+  }
+
+  Serial.print(" Toprak Nem: ");
+  Serial.println(sensor_data.soil_moisture);
+
+  Serial.print(" Işık Şiddeti: ");
+  Serial.println(sensor_data.light_level);
+
+  Serial.print(" Hava Kalitesi: ");
+  Serial.println(sensor_data.air_quality);
+
+  Serial.print(" Su Seviyesi: ");
+  Serial.println(sensor_data.water_level);
+
+  Serial.println("-----------------------------");
+}
+
+void valve_control() {
+  if (currentMode == MODE_IDLE || control_mode == MODE_MANUAL) {
+    return;
+  }
+  if (sensor_data.soil_moisture >= thresholds.moisture_threshold) {
+    if (!valve_flag) {
+      digitalWrite(VALVE_RELAY_PIN, HIGH);
+      valve_flag = true;
+      Serial.println(" Valf açıldı");
+    }
+  } else {
+    if (valve_flag) {
+      digitalWrite(VALVE_RELAY_PIN, LOW);
+      valve_flag = false;
+      Serial.println(" Valf kapandı");
+    }
+  }
+}
+
+void temperature_control() {
+  if (currentMode == MODE_IDLE || control_mode == MODE_MANUAL) {
+    return;
+  }
+  if (sensor_data.temperature > thresholds.temp_max) {
+    if (!fan_flag) {
+      digitalWrite(FAN_RELAY_PIN, LOW);
+      fan_flag = true;
+      Serial.println(" Fan açıldı (yüksek sıcaklık)");
+    }
+    if (heater_flag) {
+      digitalWrite(HEATER_RELAY_PIN, LOW);
+      heater_flag = false;
+      Serial.println(" Isıtıcı kapandı");
+    }
+  } else if (sensor_data.temperature < thresholds.temp_min) {
+    if (!heater_flag) {
+      digitalWrite(HEATER_RELAY_PIN, HIGH);
+      heater_flag = true;
+      Serial.println(" Isıtıcı açıldı (düşük sıcaklık)");
+    }
+    if (fan_flag) {
+      digitalWrite(FAN_RELAY_PIN, HIGH);
+      fan_flag = false;
+      Serial.println(" Fan kapandı");
+    }
+  } else {
+    if (fan_flag) {
+      digitalWrite(FAN_RELAY_PIN, HIGH);
+      fan_flag = false;
+      Serial.println(" Fan kapatıldı (normal sıcaklık)");
+    }
+    if (heater_flag) {
+      digitalWrite(HEATER_RELAY_PIN, LOW);
+      heater_flag = false;
+      Serial.println(" Isıtıcı kapatıldı (normal sıcaklık)");
+    }
+  }
+}
+
+void buzzer_control() {
+  if (currentMode == MODE_IDLE || control_mode == MODE_MANUAL) {
+    return;
+  }
+  if (sensor_data.water_level < thresholds.water_low_threshold) {
+    if (!buzzer_flag) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzer_flag = true;
+      Serial.println(" Su seviyesi DÜŞÜK! BUZZER aktif!");
+    }
+  } else {
+    if (buzzer_flag) {
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzer_flag = false;
+      Serial.println(" Su seviyesi normal. BUZZER kapalı.");
+    }
+  }
+}
+
+void main_page(void) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setRotation(1);
+  tft.setTextDatum(CC_DATUM);  // Metinleri ortalamak için
+  tft.setTextSize(1);
+
+  // Başlık (iki satır)
+  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+  tft.drawString("Yetistirmek istediginiz", 162 / 2, 7);
+  tft.drawString("bitkiyi seciniz.", 162 / 2, 20);
+
+  // Çizgiler (kutu ayırıcılar)
+  tft.drawLine(0, 30, 162, 30, TFT_WHITE);
+  tft.drawLine(0, 65, 162, 65, TFT_WHITE);
+  tft.drawLine(0, 100, 162, 100, TFT_WHITE);
+
+  // Yazılar
+  tft.setTextSize(2);
+  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+
+  // Seçenekleri kutuların merkezine yaz
+  tft.drawString("FESLEGEN", 162 / 2, (30 + 65) / 2);   // 47
+  tft.drawString("BIBER", 162 / 2, (65 + 100) / 2);     // 82
+  tft.drawString("LAVANTA", 162 / 2, (100 + 132) / 2);  // 116
+}
+
+void relay_close(void) {
+  digitalWrite(VALVE_RELAY_PIN, LOW);
+  digitalWrite(HEATER_RELAY_PIN, LOW);
+  digitalWrite(FAN_RELAY_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, LOW);
+  valve_flag = false;
+  fan_flag = false;
+  heater_flag = false;
+  buzzer_flag = false;
+  Serial.println("Röleler kapatıldı.");
+}
+
+void sensor_page(Mode mode) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setRotation(1);
+  tft.setTextDatum(CC_DATUM);
+  tft.setTextColor(ST7735_RED, ST7735_BLACK);
+  tft.setTextSize(1);
+
+  switch (mode) {
+    case MODE_FESLEGEN:
+      tft.drawString("Feslegen icin uygun", 162 / 2, 7);
+      tft.drawString("ortam hazirlaniyor.", 162 / 2, 20);
+      break;
+    case MODE_BIBER:
+      tft.drawString("Biber icin uygun", 162 / 2, 7);
+      tft.drawString("ortam hazirlaniyor.", 162 / 2, 20);
+      break;
+    case MODE_LAVANTA:
+      tft.drawString("Lavanta icin uygun", 162 / 2, 7);
+      tft.drawString("ortam hazirlaniyor.", 162 / 2, 20);
+      break;
+  }
+  tft.drawLine(0, 30, 162, 30, TFT_WHITE);
+
+  tft.setTextColor(ST7735_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("Sicaklik:", 10, 35);
+  tft.drawString(String(sensor_data.temperature, 1) + " C", 115, 35);
+  tft.drawString("Nem:", 10, 55);
+  tft.drawString(String(sensor_data.humidity, 1) + " %", 115, 55);
+
+  tft.drawString("Toprak Nem:", 10, 75);
+  if (sensor_data.soil_moisture >= thresholds.moisture_threshold) {
+    tft.drawString("Kuru", 115, 75);
+  } else {
+    tft.drawString("Nemli", 115, 75);
+  }
+
+  tft.drawString("Hava Kalitesi:", 10, 95);
+  if (sensor_data.air_quality < 300) {  //hava kalitesi sensörü değeri
+    tft.drawString("Iyi", 115, 95);
+  } else if (sensor_data.air_quality >= 300 && sensor_data.air_quality <= 400) {
+    tft.drawString("Orta", 115, 95);
+  } else if (sensor_data.air_quality > 400) {
+    tft.drawString("Kotu", 115, 95);
+  }
+
+  tft.drawString("Depo Su Seviyesi:", 10, 115);
+  if (sensor_data.water_level >= thresholds.water_low_threshold) {
+    tft.drawString("Yeterli", 115, 115);
+  } else {
+    tft.drawString("Kritik", 115, 115);
+  }
+}
+
+void bluetooth_receive() {
+  if (SerialBT.available()) {
+    String incoming = SerialBT.readStringUntil('\n');
+    incoming.trim();
+
+    Serial.print(" Gelen BT Mesajı: ");
+    Serial.println(incoming);
+
+    if (incoming == "FESLEGEN") {
+      currentMode = MODE_FESLEGEN;
+      Serial.println(" Bluetooth ile FESLEGEN modu seçildi.");
+    } else if (incoming == "BIBER") {
+      currentMode = MODE_BIBER;
+      Serial.println(" Bluetooth ile BIBER modu seçildi.");
+    } else if (incoming == "LAVANTA") {
+      currentMode = MODE_LAVANTA;
+      Serial.println(" Bluetooth ile LAVANTA modu seçildi.");
+    } else if (incoming == "IDLE") {
+      currentMode = MODE_IDLE;
+      Serial.println(" Bluetooth ile IDLE moduna geçildi.");
+    } else if (incoming == "FAN_ON") {
+      digitalWrite(FAN_RELAY_PIN, LOW);
+      fan_flag = true;
+      control_mode = MODE_MANUAL;
+    } else if (incoming == "FAN_OFF") {
+      digitalWrite(FAN_RELAY_PIN, HIGH);
+      fan_flag = false;
+      control_mode = MODE_MANUAL;
+
+    } else if (incoming == "HEATER_ON") {
+      digitalWrite(HEATER_RELAY_PIN, HIGH);
+      heater_flag = true;
+      control_mode = MODE_MANUAL;
+
+    } else if (incoming == "HEATER_OFF") {
+      digitalWrite(HEATER_RELAY_PIN, LOW);
+      heater_flag = false;
+      control_mode = MODE_MANUAL;
+
+    } else if (incoming == "VALVE_ON") {
+      digitalWrite(VALVE_RELAY_PIN, HIGH);
+      valve_flag = true;
+      control_mode = MODE_MANUAL;
+
+    } else if (incoming == "VALVE_OFF") {
+      digitalWrite(VALVE_RELAY_PIN, LOW);
+      valve_flag = false;
+      control_mode = MODE_MANUAL;
+
+    } else if (incoming == "MODE_AUTO") {
+      control_mode = MODE_AUTO;
+    } else {
+      Serial.println(" Geçersiz Bluetooth komutu geldi!");
+    }
+  }
+}
+
+void bluetooth_send() {
+  if (SerialBT.hasClient()) {  // Bir cihaz bağlı mı kontrol et
+    String outgoing = "";
+
+    //  outgoing += "SICAKLIK:";
+    outgoing += String(sensor_data.temperature, 1);
+    outgoing += "|";
+
+    //  outgoing += "NEM:";
+    outgoing += String(sensor_data.humidity, 1);
+    outgoing += "|";
+
+    // outgoing += "TOPRAK_NEM:";
+    outgoing += String(sensor_data.soil_moisture);
+    outgoing += "|";
+
+    // // outgoing += "ISIK:";
+    outgoing += String(sensor_data.light_level);
+    outgoing += "|";
+
+    // // outgoing += "HAVA:";
+    outgoing += String(sensor_data.air_quality);
+    outgoing += "|";
+
+    // // outgoing += "SU:";
+    outgoing += String(sensor_data.water_level);
+    //outgoing += "#\n";  // Mesajın sonu olduğunu belirtecek
+
+    SerialBT.print(outgoing);  // Bluetooth üzerinden gönder
+    Serial.print(" Gönderildi: ");
+    Serial.println(outgoing);
+  }
+}
+
+void rgb_setup(void) {
+  // RGB PWM Kurulumu
+  ledcSetup(RED_CHANNEL, 5000, 8);
+  ledcSetup(GREEN_CHANNEL, 5000, 8);
+  ledcSetup(BLUE_CHANNEL, 5000, 8);
+
+  ledcAttachPin(RED_PIN, RED_CHANNEL);
+  ledcAttachPin(GREEN_PIN, GREEN_CHANNEL);
+  ledcAttachPin(BLUE_PIN, BLUE_CHANNEL);
+
+  ledcWrite(RED_CHANNEL, 0);
+  ledcWrite(GREEN_CHANNEL, 0);
+  ledcWrite(BLUE_CHANNEL, 0);
+}
+
+
+void set_rgb_color(Mode mode) {
+  switch (mode) {
+    case MODE_FESLEGEN:
+      baseRed = 200;
+      baseGreen = 0;
+      baseBlue = 200;  //Mor, Feslegen icin uygun ışık ortamı
+      break;
+    case MODE_BIBER:
+      baseRed = 255;
+      baseGreen = 50;
+      baseBlue = 50;  //Kırmızımsı,  Biber icin uygun ışık ortamı
+      break;
+    case MODE_LAVANTA:
+      baseRed = 180;
+      baseGreen = 50;
+      baseBlue = 150;  //Açık mor, Lavanta icin uygun ışık ortamı
+      break;
+    case MODE_IDLE:
+      baseRed = 255;
+      baseGreen = 255;
+      baseBlue = 255;
+      break;
+  }
+
+  ledcWrite(RED_CHANNEL, baseRed);
+  ledcWrite(GREEN_CHANNEL, baseGreen);
+  ledcWrite(BLUE_CHANNEL, baseBlue);
+}
+
+void adjust_brightness(void) {
+  uint16_t light = analogRead(LDR_PIN);
+  uint8_t brightness = map(light, 4095, 0, 255, 50);
+
+  ledcWrite(RED_CHANNEL, (baseRed * brightness) / 255);
+  ledcWrite(GREEN_CHANNEL, (baseGreen * brightness) / 255);
+  ledcWrite(BLUE_CHANNEL, (baseBlue * brightness) / 255);
+}
