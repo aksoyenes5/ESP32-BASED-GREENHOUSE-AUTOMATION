@@ -1,0 +1,129 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+
+// Kamera modelini belirtin - PSRAM desteği olan AI Thinker modülü
+#define CAMERA_MODEL_AI_THINKER 
+
+#include "camera_pins.h"
+
+// ===========================
+// WiFi adınızı ve şifrenizi girin
+// ===========================
+const char* ssid = "HUAWEI P20 lite";
+const char* password = "12345678";
+
+void startCameraServer();
+void setupLedFlash(int pin);
+
+void setup() {
+  Serial.begin(115200);        // Seri haberleşmeyi başlat
+  Serial.setDebugOutput(true); // Seri çıkışta hata ayıklama bilgisi göster
+  Serial.println();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0; // LEDC kanal seçimi
+  config.ledc_timer = LEDC_TIMER_0;     // LEDC zamanlayıcı seçimi
+  config.pin_d0 = Y2_GPIO_NUM;          // Kamera veri pini D0
+  config.pin_d1 = Y3_GPIO_NUM;          // Kamera veri pini D1
+  config.pin_d2 = Y4_GPIO_NUM;          // Kamera veri pini D2
+  config.pin_d3 = Y5_GPIO_NUM;          // Kamera veri pini D3
+  config.pin_d4 = Y6_GPIO_NUM;          // Kamera veri pini D4
+  config.pin_d5 = Y7_GPIO_NUM;          // Kamera veri pini D5
+  config.pin_d6 = Y8_GPIO_NUM;          // Kamera veri pini D6
+  config.pin_d7 = Y9_GPIO_NUM;          // Kamera veri pini D7
+  config.pin_xclk = XCLK_GPIO_NUM;      // Harici saat pini (XCLK)
+  config.pin_pclk = PCLK_GPIO_NUM;      // Piksel saati pini (PCLK)
+  config.pin_vsync = VSYNC_GPIO_NUM;    // Dikey senkronizasyon pini (VSYNC)
+  config.pin_href = HREF_GPIO_NUM;      // Yatay referans pini (HREF)
+  config.pin_sccb_sda = SIOD_GPIO_NUM;  // SCCB veri pini (SDA)
+  config.pin_sccb_scl = SIOC_GPIO_NUM;  // SCCB saat pini (SCL)
+  config.pin_pwdn = PWDN_GPIO_NUM;      // Güç kapatma pini (PWDN)
+  config.pin_reset = RESET_GPIO_NUM;    // Reset pini
+  config.xclk_freq_hz = 20000000;       // XCLK frekansı 20 MHz
+  config.frame_size = FRAMESIZE_UXGA;   // Görüntü çözünürlüğü: UXGA (1600x1200)
+  config.pixel_format = PIXFORMAT_JPEG; // Yayın için JPEG formatı
+  // config.pixel_format = PIXFORMAT_RGB565; // Yüz algılama/tanıma için RGB formatı
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY; // Buffer boşken resim çek
+  config.fb_location = CAMERA_FB_IN_PSRAM;   // Frame buffer'ı PSRAM'de tut
+  config.jpeg_quality = 12;                  // JPEG kalite ayarı (0-63, daha düşük = daha iyi kalite)
+  config.fb_count = 1;                       // Frame buffer sayısı
+  
+  // PSRAM varsa daha yüksek çözünürlük ve daha iyi JPEG kalitesi ile başlat
+  if(config.pixel_format == PIXFORMAT_JPEG){
+    if(psramFound()){
+      config.jpeg_quality = 10;             // Kaliteyi daha iyi yap
+      config.fb_count = 2;                  // 2 buffer kullan
+      config.grab_mode = CAMERA_GRAB_LATEST; // En son çekilmiş görüntüyü al
+    } else {
+      // PSRAM yoksa çözünürlüğü sınırla
+      config.frame_size = FRAMESIZE_SVGA;   // Çözünürlüğü SVGA (800x600) yap
+      config.fb_location = CAMERA_FB_IN_DRAM; // Frame buffer'ı DRAM'e taşı
+    }
+  } else {
+    // Yüz algılama/tanıma için en iyi seçenek
+    config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+    config.fb_count = 2;
+#endif
+  }
+
+#if defined(CAMERA_MODEL_ESP_EYE)
+  pinMode(13, INPUT_PULLUP); // Gömülü butonlar için pull-up
+  pinMode(14, INPUT_PULLUP);
+#endif
+
+  // Kamera başlatma
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Kamera başlatılamadı, hata kodu: 0x%x", err);
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  // Başlangıç sensörleri dikey çevrilmiş ve renkler fazla doygun olabilir
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);        // Görüntüyü çevir
+    s->set_brightness(s, 1);   // Biraz parlaklığı artır
+    s->set_saturation(s, -2);  // Doygunluğu biraz azalt
+  }
+  // Daha yüksek başlangıç FPS için çözünürlüğü düşür
+  if(config.pixel_format == PIXFORMAT_JPEG){
+    s->set_framesize(s, FRAMESIZE_QVGA); // 320x240 çözünürlük
+  }
+
+#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
+  s->set_vflip(s, 1);          // Görüntüyü çevir
+  s->set_hmirror(s, 1);        // Yatay yansıma
+#endif
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+  s->set_vflip(s, 1);          // Görüntüyü çevir
+#endif
+
+// LED flaşı ayarla (camera_pins.h içinde tanımlı LED pini varsa)
+#if defined(LED_GPIO_NUM)
+  setupLedFlash(LED_GPIO_NUM);
+#endif
+
+  WiFi.begin(ssid, password); // WiFi bağlantısını başlat
+  WiFi.setSleep(false);       // WiFi uyku modunu kapat
+
+  // WiFi bağlantısı kurulana kadar bekle
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi bağlantısı başarılı");
+
+  startCameraServer(); // Kamera web sunucusunu başlat
+
+  Serial.print("Kamera hazır! Bağlanmak için 'http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("' adresini kullanın");
+}
+
+void loop() {
+  // Ana döngü boş bırakılmıştır. Tüm işlemler web sunucusu tarafından başka bir görevde yapılır.
+  delay(10000);
+}
